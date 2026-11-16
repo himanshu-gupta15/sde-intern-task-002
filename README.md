@@ -155,3 +155,40 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+1. **Paying a share is one conditional `UPDATE`, not read-then-write.**
+   `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL RETURNING ...`
+   SQLite applies writes one at a time, so when two requests race exactly one of them matches the row.
+   The loser updates nothing and falls back to a read: same `Idempotency-Key` → `200` with the stored
+   result (a retry), different key → `409`, no row → `404`. The key is stored on the share itself,
+   so no separate idempotency table is needed, and the `shares_paid_has_key` CHECK makes a paid share
+   without a key impossible. Trade-off: keys are scoped per share, not globally, which is all the spec asks for.
+
+2. **Join order is an explicit `position` column, assigned inside the insert.**
+   Adding a member is a single `INSERT ... SELECT ... FROM homes WHERE id = ?` that also computes
+   `MAX(position) + 1`. One statement checks that the home exists (0 rows inserted → `404`), picks the
+   position and inserts, so concurrent adds cannot collide; `UNIQUE (home_id, position)` backs this up.
+   I did not rely on timestamps or `rowid` because ties and reuse make them a fragile ordering key.
+   The split itself is a pure function (`api/src/lib/split.ts`): everyone gets `floor(total / n)` and the
+   first `total % n` members get one extra cent, so shares always add up to the total.
+
+3. **Validation in code, guarantees in the database.**
+   Handlers validate input by hand (no library) and return `422` with `{ error }`; unknown routes and
+   unexpected exceptions also answer JSON (`404` / `500`, without leaking internals). The schema repeats
+   the important rules as named constraints (foreign keys, `bills_total_positive_integer` with a
+   `typeof(...) = 'integer'` check, `shares_bill_member_unique`, `members_home_position_unique`,
+   `shares_paid_has_key`), so even a bug in the code cannot store a negative bill, a half-paid share or
+   a share for a missing bill. A bill and its shares are inserted with `db.batch`, which D1 runs as one
+   transaction.
+
+**Web page.** A small typed `fetch` wrapper turns every failure (network error, 10 s timeout,
+non-JSON 500) into an `ApiError` with a readable message, so the page never crashes on a bad answer.
+The page has loading (with a "still trying" hint when slow), empty, and error states with retry.
+A payment is only shown as paid after the server confirms it; on failure the share stays unpaid with
+an inline error, and a retry reuses the same `Idempotency-Key` so a lost response cannot cause a double payment.
+
+**Extra endpoints** for the page: `GET /api/homes/:homeId` (home and members) and
+`GET /api/homes/:homeId/bills` (bills with shares). Extra tests live in `api/test/edge-cases.test.ts`
+(concurrent payments, concurrent member adds, invalid input, database constraints).
