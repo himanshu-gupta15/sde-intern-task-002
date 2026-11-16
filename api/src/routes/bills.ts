@@ -37,10 +37,9 @@ bills.post('/:billId/shares/:shareId/pay', async (c) => {
 
   if (paid) return c.json(toShare(paid), 200)
 
-  // Nothing was updated: the share does not exist, belongs to another bill, or is
-  // already paid. Read it to tell these cases apart.
-  // One query: the bill row always comes back if the bill exists; the share columns
-  // are NULL when the share is missing or belongs to another bill.
+  // Nothing was updated: the bill or share is missing, or the share is already paid.
+  // One read tells these apart: the bill row comes back if the bill exists, and the
+  // share columns are NULL when the share is missing or belongs to another bill.
   const row = await db
     .prepare(
       `SELECT b.id AS found_bill_id, s.id, s.bill_id, s.member_id, s.amount_cents,
